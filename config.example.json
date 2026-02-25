@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "activeProfile": "default",
+  "profiles": {
+    "default": {
+      "mappings": [
+        {
+          "id": "A0000001-0000-0000-0000-000000000001",
+          "description": "Pad 1: Open Safari",
+          "device": "iRig",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 36 },
+          "action": { "type": "openApp", "bundleId": "com.apple.Safari" },
+          "led": { "color": "blue", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000002",
+          "description": "Pad 2: Open Terminal",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 37 },
+          "action": { "type": "openApp", "bundleId": "com.apple.Terminal" },
+          "led": { "color": "green", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000003",
+          "description": "Pad 3: Open Messages",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 38 },
+          "action": { "type": "openApp", "bundleId": "com.apple.MobileSMS" },
+          "led": { "color": "cyan", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000004",
+          "description": "Pad 4: Open Music",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 39 },
+          "action": { "type": "openApp", "bundleId": "com.apple.Music" },
+          "led": { "color": "magenta", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000005",
+          "description": "Pad 5: Switch to MacBook speakers",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 40 },
+          "action": { "type": "setAudioOutput", "device": "MacBook Pro Speakers" },
+          "led": { "color": "blue", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000006",
+          "description": "Pad 6: Switch to headphones",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 41 },
+          "action": { "type": "setAudioOutput", "device": "External Headphones" },
+          "led": { "color": "yellow", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000007",
+          "description": "Pad 7: Toggle mic mute",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 42 },
+          "action": { "type": "toggleMicMute", "device": "default" },
+          "led": { "color": "red", "behavior": "toggleOnMute" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000008",
+          "description": "Pad 8: Switch to streaming profile",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 43 },
+          "action": { "type": "switchProfile", "profile": "streaming" },
+          "led": { "color": "white", "behavior": "solid" }
+        },
+        {
+          "id": "A0000001-0000-0000-0000-000000000009",
+          "description": "Fader 1: Master volume",
+          "trigger": { "type": "controlChange", "channel": 10, "controller": 1 },
+          "action": { "type": "setVolume", "device": "default" }
+        }
+      ]
+    },
+    "streaming": {
+      "mappings": [
+        {
+          "id": "B0000001-0000-0000-0000-000000000001",
+          "description": "Pad 1: Open OBS",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 36 },
+          "action": { "type": "openApp", "bundleId": "com.obsproject.obs-studio" },
+          "led": { "color": "green", "behavior": "solid" }
+        },
+        {
+          "id": "B0000001-0000-0000-0000-000000000002",
+          "description": "Pad 8: Back to default profile",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 43 },
+          "action": { "type": "switchProfile", "profile": "default" },
+          "led": { "color": "white", "behavior": "solid" }
+        }
+      ]
+    }
+  }
+}
