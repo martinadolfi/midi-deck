@@ -75,8 +75,14 @@ enum AppActions {
 
         guard eligibleWindows.count > 1 else { return }
 
-        // Windows are in front-to-back order; raise the second one to cycle
-        AXUIElementPerformAction(eligibleWindows[1], kAXRaiseAction as CFString)
+        // Windows are in front-to-back order. Raise the backmost window to cycle
+        // through all windows, not just the first two.
+        // A, B, C → raise C → C, A, B → raise B → B, C, A → raise A → A, B, C
+        let target = eligibleWindows.last!
+        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+        // Setting main window attribute helps macOS switch Spaces when the
+        // target window lives on a different virtual desktop.
+        AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
         app.activate()
         log("[App] Cycled window for \(app.localizedName ?? "app")")
     }
