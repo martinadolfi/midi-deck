@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreMIDI
 import os.log
+import ApplicationServices
 
 private let logger = Logger(subsystem: "com.midideck", category: "app")
 
@@ -41,6 +42,28 @@ final class AppState: ObservableObject {
         }
 
         log("[MidiDeck] Started")
+        checkAccessibilityPermission()
+    }
+
+    private func checkAccessibilityPermission() {
+        let trusted = AXIsProcessTrusted()
+        if !trusted {
+            log("[MidiDeck] WARNING: Accessibility permission not granted — window cycling will not work")
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Accessibility Permission Required"
+                alert.informativeText = "MidiDeck needs Accessibility access to cycle windows. Please grant permission in System Settings → Privacy & Security → Accessibility, then relaunch MidiDeck."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Open System Settings")
+                alert.addButton(withTitle: "Later")
+                let response = alert.runModal()
+                if response == .alertFirstButtonReturn {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                }
+            }
+        } else {
+            log("[MidiDeck] Accessibility permission granted")
+        }
     }
 
     deinit {
