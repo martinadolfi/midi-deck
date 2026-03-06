@@ -4,7 +4,7 @@ A macOS menu bar app that maps MIDI controller inputs to system actions. Use you
 
 ## Features
 
-- **Launch applications** — Trigger app launches from MIDI pads or keys
+- **Launch applications** — Trigger app launches from MIDI pads or keys, with automatic window cycling when the app is already focused
 - **Audio device switching** — Instantly switch between speakers, headphones, and microphones
 - **Volume control** — Map MIDI faders/knobs to system volume
 - **Mic mute toggle** — One-button mute/unmute with LED feedback
@@ -24,10 +24,19 @@ A macOS menu bar app that maps MIDI controller inputs to system actions. Use you
 ```bash
 git clone <repo-url>
 cd midi-deck
-swift build -c release
+./scripts/install.sh
 ```
 
-The built binary will be at `.build/release/MidiDeck`.
+This builds a release binary and installs it as `/Applications/MidiDeck.app`, so it's launchable via Spotlight (Cmd+Space).
+
+To update after pulling new changes, run the same script again — it will rebuild, replace the binary, and relaunch the app.
+
+You can also build and run manually without installing:
+
+```bash
+swift build -c release
+.build/release/MidiDeck
+```
 
 ## Setup
 
@@ -84,7 +93,7 @@ MidiDeck is configured through a JSON file. It looks for config in this order:
 
 | Action | What it does | Key fields |
 |--------|-------------|------------|
-| `openApp` | Launch or focus an app | `bundleId` |
+| `openApp` | Launch, focus, or cycle windows of an app | `bundleId` |
 | `setAudioOutput` | Switch output device | `device` (device name) |
 | `setAudioInput` | Switch input device | `device` (device name) |
 | `setVolume` | Control volume with a fader/knob | `device` (`"default"` or device name) |
@@ -116,6 +125,10 @@ Click the menu bar icon to access the settings window, where you can:
 - Use MIDI Learn to capture events from your controller
 - Switch profiles
 - See connected MIDI devices
+
+## Permissions
+
+MidiDeck requires **Accessibility** permission for window cycling. When you first trigger an `openApp` action on an already-focused app, macOS will prompt you to grant access in **System Settings → Privacy & Security → Accessibility**. Without this permission, the app will still launch and focus apps normally.
 
 ## Troubleshooting
 
