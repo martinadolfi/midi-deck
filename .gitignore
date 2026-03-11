@@ -19,3 +19,7 @@ xcuserdata/
 
 # Claude Code local settings
 .claude/
+
+# BMAD artifacts
+_bmad/
+_bmad-output/
