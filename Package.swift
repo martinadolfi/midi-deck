@@ -16,6 +16,11 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
             ]
+        ),
+        .testTarget(
+            name: "MidiDeckTests",
+            dependencies: ["MidiDeck"],
+            path: "Tests/MidiDeckTests"
         )
     ]
 )

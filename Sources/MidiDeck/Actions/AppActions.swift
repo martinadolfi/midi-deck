@@ -4,25 +4,32 @@ import Foundation
 enum AppActions {
     /// Open an app by bundle ID. Launches if not running, focuses if already running,
     /// cycles through windows if already focused.
-    static func openApp(bundleId: String) {
+    @discardableResult
+    static func openApp(bundleId: String) -> Bool {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
             if app.isActive {
                 cycleWindows(for: app)
+                return true
             } else {
-                app.activate()
-                log("[App] Focused: \(app.localizedName ?? bundleId)")
+                let activated = app.activate()
+                if activated {
+                    log("[App] Focused: \(app.localizedName ?? bundleId)")
+                } else {
+                    log("[App] Failed to focus: \(app.localizedName ?? bundleId)")
+                }
+                return activated
             }
         } else {
-            launchApp(bundleId: bundleId)
+            return launchApp(bundleId: bundleId)
         }
     }
 
     // MARK: - Private
 
-    private static func launchApp(bundleId: String) {
+    private static func launchApp(bundleId: String) -> Bool {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
             log("[App] Bundle ID not found: \(bundleId)")
-            return
+            return false
         }
 
         let config = NSWorkspace.OpenConfiguration()
@@ -35,6 +42,7 @@ enum AppActions {
                 log("[App] Launched: \(app.localizedName ?? bundleId)")
             }
         }
+        return true
     }
 
     private static func cycleWindows(for app: NSRunningApplication) {

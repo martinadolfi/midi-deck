@@ -17,8 +17,8 @@ killall "$APP_NAME" 2>/dev/null && sleep 1 || true
 echo "==> Installing to ${APP_PATH}..."
 mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
 
-# Copy binary
-cp ".build/arm64-apple-macosx/release/${APP_NAME}" "${CONTENTS}/MacOS/${APP_NAME}"
+# Copy the release product through SwiftPM's architecture-independent path.
+cp ".build/release/${APP_NAME}" "${CONTENTS}/MacOS/${APP_NAME}"
 
 # Write Info.plist (only if it doesn't exist yet)
 if [ ! -f "${CONTENTS}/Info.plist" ]; then

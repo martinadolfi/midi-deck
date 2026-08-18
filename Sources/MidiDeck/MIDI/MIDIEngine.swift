@@ -1,149 +1,409 @@
 import CoreMIDI
 import Foundation
 
-final class MIDIEngine: ObservableObject {
+final class MIDIEngine: ObservableObject, @unchecked Sendable {
+    private let topologyQueue = DispatchQueue(label: "com.midideck.midi.topology")
+    private let topologyQueueKey = DispatchSpecificKey<Void>()
+    private let eventQueue = DispatchQueue(label: "com.midideck.midi.events", qos: .userInteractive)
+    private let sourceIdentityLock = NSLock()
+    private let subscriberLock = NSLock()
+    private let lastEventLock = NSLock()
+
     private var client: MIDIClientRef = 0
     private var inputPort: MIDIPortRef = 0
-    private var connectedSources: Set<MIDIEndpointRef> = []
+    private var connectedSourceEndpoints: Set<MIDIEndpointRef> = []
+    private var sourceIdentities: [MIDIEndpointRef: MIDIEndpointReference] = [:]
+    private var eventContinuations: [UUID: AsyncStream<MIDIInputEvent>.Continuation] = [:]
+    private var pendingLastEvent: MIDIInputEvent?
+    private var lastEventUpdateScheduled = false
 
-    @Published var connectedDeviceNames: [String] = []
+    /// Sources that are currently connected to the input port.
+    @Published private(set) var connectedSources: [MIDIEndpointReference] = []
 
-    private var eventContinuation: AsyncStream<MIDIEvent>.Continuation?
-    private(set) var eventStream: AsyncStream<MIDIEvent>!
+    /// Destinations currently advertised by CoreMIDI.
+    @Published private(set) var connectedDestinations: [MIDIEndpointReference] = []
+
+    /// The most recently received event, useful for status and diagnostics UI.
+    @Published private(set) var lastEvent: MIDIInputEvent?
+
+    /// A startup failure means connecting a controller cannot fix the issue;
+    /// surface it separately from the ordinary no-controller state.
+    @Published private(set) var initializationError: String?
+
+    /// Compatibility view of `connectedSources` for the existing menu UI.
+    var connectedDeviceNames: [String] {
+        connectedSources.map(\.name)
+    }
 
     init() {
-        let (stream, continuation) = AsyncStream<MIDIEvent>.makeStream()
-        self.eventStream = stream
-        self.eventContinuation = continuation
+        topologyQueue.setSpecific(key: topologyQueueKey, value: ())
+    }
+
+    deinit {
+        stop()
+        finishEventStreams()
+    }
+
+    /// Returns an independent event stream for each caller.
+    ///
+    /// A slow subscriber only retains its newest events and cannot consume events
+    /// intended for another subscriber (for example, runtime dispatch and MIDI Learn).
+    func events(bufferLimit: Int = 256) -> AsyncStream<MIDIInputEvent> {
+        let id = UUID()
+        let boundedLimit = max(1, bufferLimit)
+        return AsyncStream(bufferingPolicy: .bufferingNewest(boundedLimit)) { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+
+            subscriberLock.lock()
+            eventContinuations[id] = continuation
+            subscriberLock.unlock()
+
+            continuation.onTermination = { [weak self] _ in
+                self?.removeEventContinuation(id: id)
+            }
+        }
     }
 
     func start() {
-        let status = MIDIClientCreateWithBlock("MidiDeck" as CFString, &client) { [weak self] notification in
-            self?.handleMIDINotification(notification)
-        }
-        guard status == noErr else {
-            log("[MIDI] Failed to create client: \(status)")
-            return
-        }
+        syncOnTopologyQueue {
+            guard client == 0, inputPort == 0 else { return }
 
-        let portStatus = MIDIInputPortCreateWithProtocol(
-            client,
-            "MidiDeck Input" as CFString,
-            ._1_0,
-            &inputPort
-        ) { [weak self] eventList, _ in
-            self?.handleEventList(eventList)
-        }
-        guard portStatus == noErr else {
-            log("[MIDI] Failed to create input port: \(portStatus)")
-            return
-        }
+            let status = MIDIClientCreateWithBlock("MidiDeck" as CFString, &client) { [weak self] notification in
+                self?.handleMIDINotification(notification)
+            }
+            guard status == noErr else {
+                client = 0
+                let message = "CoreMIDI client could not start (error \(status))."
+                publishInitializationError(message)
+                log("[MIDI] \(message)")
+                return
+            }
 
-        connectAllSources()
-        log("[MIDI] Engine started")
+            let portStatus = MIDIInputPortCreateWithProtocol(
+                client,
+                "MidiDeck Input" as CFString,
+                ._1_0,
+                &inputPort
+            ) { [weak self] eventList, sourceConnectionRefCon in
+                self?.handleEventList(eventList, sourceConnectionRefCon: sourceConnectionRefCon)
+            }
+            guard portStatus == noErr else {
+                inputPort = 0
+                MIDIClientDispose(client)
+                client = 0
+                let message = "CoreMIDI input could not start (error \(portStatus))."
+                publishInitializationError(message)
+                log("[MIDI] \(message)")
+                return
+            }
+
+            publishInitializationError(nil)
+            refreshTopology()
+            log("[MIDI] Engine started")
+        }
     }
 
     func stop() {
-        for source in connectedSources {
-            MIDIPortDisconnectSource(inputPort, source)
+        syncOnTopologyQueue {
+            guard client != 0 || inputPort != 0 else { return }
+
+            if inputPort != 0 {
+                for source in connectedSourceEndpoints {
+                    MIDIPortDisconnectSource(inputPort, source)
+                }
+                connectedSourceEndpoints.removeAll()
+                clearSourceIdentities()
+                MIDIPortDispose(inputPort)
+                inputPort = 0
+            }
+            if client != 0 {
+                MIDIClientDispose(client)
+                client = 0
+            }
+
+            publishTopology(sources: [], destinations: [])
+            log("[MIDI] Engine stopped")
         }
-        connectedSources.removeAll()
-        if inputPort != 0 {
-            MIDIPortDispose(inputPort)
-            inputPort = 0
-        }
-        if client != 0 {
-            MIDIClientDispose(client)
-            client = 0
-        }
-        eventContinuation?.finish()
-        log("[MIDI] Engine stopped")
     }
 
     // MARK: - Source Management
 
-    private func connectAllSources() {
-        let sourceCount = MIDIGetNumberOfSources()
-        var newNames: [String] = []
-        for i in 0..<sourceCount {
-            let source = MIDIGetSource(i)
-            if !connectedSources.contains(source) {
-                let status = MIDIPortConnectSource(inputPort, source, nil)
-                if status == noErr {
-                    connectedSources.insert(source)
-                    let name = Self.endpointName(source)
-                    newNames.append(name)
-                    log("[MIDI] Connected source: \(name)")
-                }
+    /// Must only be called on `topologyQueue`.
+    private func refreshTopology() {
+        guard client != 0, inputPort != 0 else { return }
+
+        var currentSources: [MIDIEndpointRef: MIDIEndpointReference] = [:]
+        for index in 0..<MIDIGetNumberOfSources() {
+            let endpoint = MIDIGetSource(index)
+            guard endpoint != 0, let reference = Self.endpointReference(endpoint) else {
+                continue
+            }
+            currentSources[endpoint] = reference
+        }
+
+        let staleSources = connectedSourceEndpoints.subtracting(currentSources.keys)
+        for source in staleSources {
+            MIDIPortDisconnectSource(inputPort, source)
+            connectedSourceEndpoints.remove(source)
+        }
+
+        replaceSourceIdentities(with: currentSources)
+
+        for (source, reference) in currentSources where !connectedSourceEndpoints.contains(source) {
+            // The endpoint itself is passed as srcConnRefCon so the read callback can
+            // recover which source produced each event without allocating refcon state.
+            let sourceRefCon = UnsafeMutableRawPointer(bitPattern: UInt(source))
+            let status = MIDIPortConnectSource(inputPort, source, sourceRefCon)
+            if status == noErr {
+                connectedSourceEndpoints.insert(source)
+                log("[MIDI] Connected source: \(reference.name) [\(reference.uniqueID)]")
             } else {
-                newNames.append(Self.endpointName(source))
+                log("[MIDI] Failed to connect source \(reference.name): \(status)")
             }
         }
-        DispatchQueue.main.async {
-            self.connectedDeviceNames = newNames
-        }
+
+        let sourceReferences = connectedSourceEndpoints.compactMap { currentSources[$0] }
+        let destinationReferences = Self.allDestinations()
+        publishTopology(
+            sources: Self.sorted(sourceReferences),
+            destinations: Self.sorted(destinationReferences)
+        )
     }
 
     private func handleMIDINotification(_ notificationPtr: UnsafePointer<MIDINotification>) {
-        let notification = notificationPtr.pointee
-        switch notification.messageID {
-        case .msgSetupChanged:
-            log("[MIDI] Setup changed — reconnecting sources")
-            // Remove stale sources
-            let currentSources = Set((0..<MIDIGetNumberOfSources()).map { MIDIGetSource($0) })
-            let stale = connectedSources.subtracting(currentSources)
-            for source in stale {
-                MIDIPortDisconnectSource(inputPort, source)
-                connectedSources.remove(source)
+        let messageID = notificationPtr.pointee.messageID
+        switch messageID {
+        case .msgIOError:
+            topologyQueue.async { [weak self] in
+                guard let self, client != 0, inputPort != 0 else { return }
+                log("[MIDI] I/O connection changed — reconnecting sources")
+                disconnectAllSources()
+                refreshTopology()
             }
-            connectAllSources()
+
+        case .msgSetupChanged, .msgObjectAdded, .msgObjectRemoved, .msgPropertyChanged,
+             .msgThruConnectionsChanged, .msgSerialPortOwnerChanged:
+            topologyQueue.async { [weak self] in
+                guard let self, client != 0, inputPort != 0 else { return }
+                log("[MIDI] Topology changed — refreshing endpoints")
+                refreshTopology()
+            }
         default:
             break
         }
     }
 
+    /// Must only be called on `topologyQueue`.
+    private func disconnectAllSources() {
+        guard inputPort != 0 else { return }
+        for source in connectedSourceEndpoints {
+            MIDIPortDisconnectSource(inputPort, source)
+        }
+        connectedSourceEndpoints.removeAll()
+    }
+
     // MARK: - Event Parsing
 
-    private func handleEventList(_ eventListPtr: UnsafePointer<MIDIEventList>) {
-        let eventList = eventListPtr.pointee
-        // Walk through the event packets using the unsafe raw pointer approach
-        withUnsafePointer(to: eventList.packet) { firstPacketPtr in
-            var packetPtr = UnsafeMutablePointer(mutating: firstPacketPtr)
-            for _ in 0..<eventList.numPackets {
-                let p = packetPtr.pointee
-                let wordCount = Int(p.wordCount)
-                if wordCount > 0 {
-                    let words = withUnsafePointer(to: p.words) { wordsPtr in
-                        wordsPtr.withMemoryRebound(to: UInt32.self, capacity: wordCount) { ptr in
-                            Array(UnsafeBufferPointer(start: ptr, count: wordCount))
-                        }
-                    }
-                    let events = MIDIEvent.parse(words: words)
-                    for event in events {
-                        eventContinuation?.yield(event)
-                    }
-                }
-                packetPtr = MIDIEventPacketNext(packetPtr)
+    private func handleEventList(
+        _ eventListPtr: UnsafePointer<MIDIEventList>,
+        sourceConnectionRefCon: UnsafeMutableRawPointer?
+    ) {
+        guard let sourceConnectionRefCon else { return }
+
+        let sourceEndpoint = MIDIEndpointRef(UInt(bitPattern: sourceConnectionRefCon))
+        guard let source = sourceIdentity(for: sourceEndpoint) else { return }
+
+        // Both MIDIEventList and MIDIEventPacket are variable-length C structs.
+        // Walk the callback's original memory instead of copying either `.pointee`,
+        // which can truncate packets containing more than their imported fixed size.
+        let eventListRaw = UnsafeRawPointer(eventListPtr)
+        let packetCountOffset = MemoryLayout<MIDIEventList>.offset(of: \MIDIEventList.numPackets)!
+        let firstPacketOffset = MemoryLayout<MIDIEventList>.offset(of: \MIDIEventList.packet)!
+        let wordCountOffset = MemoryLayout<MIDIEventPacket>.offset(of: \MIDIEventPacket.wordCount)!
+        let wordsOffset = MemoryLayout<MIDIEventPacket>.offset(of: \MIDIEventPacket.words)!
+        let packetCount = eventListRaw.load(fromByteOffset: packetCountOffset, as: UInt32.self)
+
+        var packetPtr = UnsafeMutableRawPointer(mutating: eventListRaw)
+            .advanced(by: firstPacketOffset)
+            .assumingMemoryBound(to: MIDIEventPacket.self)
+        var receivedWords: [UInt32] = []
+
+        for _ in 0..<packetCount {
+            let packetRaw = UnsafeRawPointer(packetPtr)
+            let wordCount = Int(packetRaw.load(fromByteOffset: wordCountOffset, as: UInt32.self))
+            if wordCount > 0 {
+                let wordsPtr = packetRaw
+                    .advanced(by: wordsOffset)
+                    .assumingMemoryBound(to: UInt32.self)
+                receivedWords.append(contentsOf: UnsafeBufferPointer(start: wordsPtr, count: wordCount))
+            }
+            packetPtr = MIDIEventPacketNext(packetPtr)
+        }
+
+        guard !receivedWords.isEmpty else { return }
+        let words = receivedWords
+        eventQueue.async { [weak self] in
+            guard let self else { return }
+            for event in MIDIEvent.parse(words: words) {
+                publish(MIDIInputEvent(source: source, event: event))
             }
         }
     }
 
     // MARK: - Helpers
 
+    static func endpointReference(_ endpoint: MIDIEndpointRef) -> MIDIEndpointReference? {
+        var uniqueID: Int32 = 0
+        let status = MIDIObjectGetIntegerProperty(endpoint, kMIDIPropertyUniqueID, &uniqueID)
+        guard status == noErr, uniqueID != 0 else {
+            log("[MIDI] Endpoint has no stable unique ID: \(status)")
+            return nil
+        }
+        return MIDIEndpointReference(uniqueID: uniqueID, name: endpointName(endpoint))
+    }
+
     static func endpointName(_ endpoint: MIDIEndpointRef) -> String {
         var name: Unmanaged<CFString>?
-        let status = MIDIObjectGetStringProperty(endpoint, kMIDIPropertyDisplayName, &name)
-        if status == noErr, let cfName = name?.takeRetainedValue() {
-            return cfName as String
+        if MIDIObjectGetStringProperty(endpoint, kMIDIPropertyDisplayName, &name) == noErr,
+           let cfName = name?.takeRetainedValue() {
+            let displayName = cfName as String
+            if !displayName.isEmpty { return displayName }
+        }
+
+        name = nil
+        if MIDIObjectGetStringProperty(endpoint, kMIDIPropertyName, &name) == noErr,
+           let cfName = name?.takeRetainedValue() {
+            let endpointName = cfName as String
+            if !endpointName.isEmpty { return endpointName }
         }
         return "Unknown"
     }
 
+    static func allSources() -> [MIDIEndpointReference] {
+        sorted((0..<MIDIGetNumberOfSources()).compactMap {
+            endpointReference(MIDIGetSource($0))
+        })
+    }
+
+    static func allDestinations() -> [MIDIEndpointReference] {
+        sorted((0..<MIDIGetNumberOfDestinations()).compactMap {
+            endpointReference(MIDIGetDestination($0))
+        })
+    }
+
     static func allSourceNames() -> [String] {
-        (0..<MIDIGetNumberOfSources()).map { endpointName(MIDIGetSource($0)) }
+        allSources().map(\.name)
     }
 
     static func allDestinationNames() -> [String] {
-        (0..<MIDIGetNumberOfDestinations()).map { endpointName(MIDIGetDestination($0)) }
+        allDestinations().map(\.name)
+    }
+
+    private static func sorted(_ endpoints: [MIDIEndpointReference]) -> [MIDIEndpointReference] {
+        endpoints.sorted {
+            let comparison = $0.name.localizedCaseInsensitiveCompare($1.name)
+            return comparison == .orderedSame ? $0.uniqueID < $1.uniqueID : comparison == .orderedAscending
+        }
+    }
+
+    private func replaceSourceIdentities(with identities: [MIDIEndpointRef: MIDIEndpointReference]) {
+        sourceIdentityLock.lock()
+        sourceIdentities = identities
+        sourceIdentityLock.unlock()
+    }
+
+    private func clearSourceIdentities() {
+        sourceIdentityLock.lock()
+        sourceIdentities.removeAll()
+        sourceIdentityLock.unlock()
+    }
+
+    private func sourceIdentity(for endpoint: MIDIEndpointRef) -> MIDIEndpointReference? {
+        sourceIdentityLock.lock()
+        defer { sourceIdentityLock.unlock() }
+        return sourceIdentities[endpoint]
+    }
+
+    private func publishTopology(
+        sources: [MIDIEndpointReference],
+        destinations: [MIDIEndpointReference]
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            self?.connectedSources = sources
+            self?.connectedDestinations = destinations
+        }
+    }
+
+    private func publishInitializationError(_ message: String?) {
+        DispatchQueue.main.async { [weak self] in
+            self?.initializationError = message
+        }
+    }
+
+    /// Publishes an already parsed event to every subscriber. Kept internal so
+    /// multicast behavior can be verified without requiring CoreMIDI hardware.
+    func publish(_ inputEvent: MIDIInputEvent) {
+        subscriberLock.lock()
+        let continuations = Array(eventContinuations.values)
+        subscriberLock.unlock()
+
+        for continuation in continuations {
+            continuation.yield(inputEvent)
+        }
+
+        scheduleLastEventUpdate(inputEvent)
+    }
+
+    private func removeEventContinuation(id: UUID) {
+        subscriberLock.lock()
+        eventContinuations.removeValue(forKey: id)
+        subscriberLock.unlock()
+    }
+
+    private func finishEventStreams() {
+        subscriberLock.lock()
+        let continuations = Array(eventContinuations.values)
+        eventContinuations.removeAll()
+        subscriberLock.unlock()
+
+        for continuation in continuations {
+            continuation.finish()
+        }
+    }
+
+    /// Coalesces high-rate CC traffic so publishing diagnostic UI state cannot
+    /// enqueue an unbounded number of main-queue updates.
+    private func scheduleLastEventUpdate(_ inputEvent: MIDIInputEvent) {
+        lastEventLock.lock()
+        pendingLastEvent = inputEvent
+        let shouldSchedule = !lastEventUpdateScheduled
+        lastEventUpdateScheduled = true
+        lastEventLock.unlock()
+
+        guard shouldSchedule else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+
+            lastEventLock.lock()
+            let latestEvent = pendingLastEvent
+            pendingLastEvent = nil
+            lastEventUpdateScheduled = false
+            lastEventLock.unlock()
+
+            if let latestEvent {
+                lastEvent = latestEvent
+            }
+        }
+    }
+
+    private func syncOnTopologyQueue(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: topologyQueueKey) != nil {
+            operation()
+        } else {
+            topologyQueue.sync(execute: operation)
+        }
     }
 }
