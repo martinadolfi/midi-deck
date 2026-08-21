@@ -123,7 +123,7 @@ MIDI channels are normalized to `1...16`. Notes, controller numbers, and values 
 - `setVolume`
 - `setInputVolume`
 
-CC execution is coalesced per profile, mapping, and source on a 30 ms main-queue timer. Repeated identical values are not applied again. Pending CC state is cleared when routing, profiles, pause state, or configuration changes.
+CC traffic is coalesced twice without delaying note events. `MIDIEngine` collapses each source/channel/controller burst over 8 ms before publishing, and `ActionExecutor` runs CoreAudio work on a dedicated queue with at most one write in flight. While that write runs, intermediate values are replaced by the newest requested value. This prevents stale fader positions from building a FIFO while keeping the UI thread and button actions responsive. Repeated identical values are not applied again, and pending CC state is cleared when routing, profiles, pause state, or configuration changes.
 
 Only the highest-priority matching mapping in the active profile runs: an exact source scope wins over an unscoped mapping, while configuration order remains the tiebreaker within a scope. Validation rejects duplicate mapping UUIDs and duplicate source-scope/trigger pairs in a profile, as well as invalid action fields and trigger/action combinations.
 

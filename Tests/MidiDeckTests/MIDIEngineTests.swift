@@ -46,6 +46,40 @@ final class MIDIEngineTests: XCTestCase {
         assertNoteOn(survivingEvent, source: source, channel: 1, note: 36, velocity: 127)
     }
 
+    func testControlChangeBurstKeepsNewestValueWithoutDelayingNotes() async {
+        let engine = MIDIEngine()
+        var subscriber = engine.events().makeAsyncIterator()
+        let source = MIDIEndpointReference(uniqueID: 99, name: "Fader Controller")
+
+        for value: UInt8 in [10, 40, 75, 127] {
+            engine.publish(MIDIInputEvent(
+                source: source,
+                event: .controlChange(channel: 3, controller: 7, value: value)
+            ))
+        }
+        engine.publish(MIDIInputEvent(
+            source: source,
+            event: .noteOn(channel: 3, note: 36, velocity: 100)
+        ))
+
+        // Discrete controls bypass the short CC coalescing window.
+        let firstEvent = await subscriber.next()
+        assertNoteOn(firstEvent, source: source, channel: 3, note: 36, velocity: 100)
+
+        // The stream receives the physical fader's newest position, not the
+        // three stale positions that preceded it.
+        guard let secondEvent = await subscriber.next() else {
+            return XCTFail("Expected the coalesced control-change event")
+        }
+        XCTAssertEqual(secondEvent.source, source)
+        guard case .controlChange(let channel, let controller, let value) = secondEvent.event else {
+            return XCTFail("Expected a control-change event")
+        }
+        XCTAssertEqual(channel, 3)
+        XCTAssertEqual(controller, 7)
+        XCTAssertEqual(value, 127)
+    }
+
     private func assertNoteOn(
         _ input: MIDIInputEvent?,
         source: MIDIEndpointReference,

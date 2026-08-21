@@ -8,6 +8,7 @@ final class MIDIEngine: ObservableObject, @unchecked Sendable {
     private let sourceIdentityLock = NSLock()
     private let subscriberLock = NSLock()
     private let lastEventLock = NSLock()
+    private let continuousEventLock = NSLock()
 
     private var client: MIDIClientRef = 0
     private var inputPort: MIDIPortRef = 0
@@ -16,6 +17,20 @@ final class MIDIEngine: ObservableObject, @unchecked Sendable {
     private var eventContinuations: [UUID: AsyncStream<MIDIInputEvent>.Continuation] = [:]
     private var pendingLastEvent: MIDIInputEvent?
     private var lastEventUpdateScheduled = false
+    private var pendingContinuousEvents: [ContinuousEventKey: PendingContinuousEvent] = [:]
+    private var continuousEventSequence: UInt64 = 0
+    private var continuousFlushID: UUID?
+
+    private struct ContinuousEventKey: Hashable {
+        let sourceID: Int32
+        let channel: UInt8
+        let controller: UInt8
+    }
+
+    private struct PendingContinuousEvent {
+        let input: MIDIInputEvent
+        let sequence: UInt64
+    }
 
     /// Sources that are currently connected to the input port.
     @Published private(set) var connectedSources: [MIDIEndpointReference] = []
@@ -48,7 +63,7 @@ final class MIDIEngine: ObservableObject, @unchecked Sendable {
     ///
     /// A slow subscriber only retains its newest events and cannot consume events
     /// intended for another subscriber (for example, runtime dispatch and MIDI Learn).
-    func events(bufferLimit: Int = 256) -> AsyncStream<MIDIInputEvent> {
+    func events(bufferLimit: Int = 64) -> AsyncStream<MIDIInputEvent> {
         let id = UUID()
         let boundedLimit = max(1, bufferLimit)
         return AsyncStream(bufferingPolicy: .bufferingNewest(boundedLimit)) { [weak self] continuation in
@@ -124,6 +139,7 @@ final class MIDIEngine: ObservableObject, @unchecked Sendable {
                 client = 0
             }
 
+            clearPendingContinuousEvents()
             publishTopology(sources: [], destinations: [])
             log("[MIDI] Engine stopped")
         }
@@ -343,9 +359,70 @@ final class MIDIEngine: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Publishes an already parsed event to every subscriber. Kept internal so
-    /// multicast behavior can be verified without requiring CoreMIDI hardware.
+    /// Publishes an already parsed event to every subscriber. Note events are
+    /// delivered immediately. High-rate control changes are collapsed by
+    /// source/channel/controller over a single display-frame-sized window, so
+    /// downstream consumers can never spend seconds replaying stale fader data.
+    /// Kept internal so delivery behavior can be verified without MIDI hardware.
     func publish(_ inputEvent: MIDIInputEvent) {
+        scheduleLastEventUpdate(inputEvent)
+
+        guard case .controlChange(let channel, let controller, _) = inputEvent.event else {
+            yieldToSubscribers(inputEvent)
+            return
+        }
+
+        let key = ContinuousEventKey(
+            sourceID: inputEvent.source.uniqueID,
+            channel: channel,
+            controller: controller
+        )
+
+        continuousEventLock.lock()
+        continuousEventSequence &+= 1
+        pendingContinuousEvents[key] = PendingContinuousEvent(
+            input: inputEvent,
+            sequence: continuousEventSequence
+        )
+
+        guard continuousFlushID == nil else {
+            continuousEventLock.unlock()
+            return
+        }
+
+        let flushID = UUID()
+        continuousFlushID = flushID
+        continuousEventLock.unlock()
+
+        eventQueue.asyncAfter(deadline: .now() + .milliseconds(8)) { [weak self] in
+            self?.flushContinuousEvents(id: flushID)
+        }
+    }
+
+    private func flushContinuousEvents(id: UUID) {
+        continuousEventLock.lock()
+        guard continuousFlushID == id else {
+            continuousEventLock.unlock()
+            return
+        }
+        let events = pendingContinuousEvents.values.sorted { $0.sequence < $1.sequence }
+        pendingContinuousEvents.removeAll(keepingCapacity: true)
+        continuousFlushID = nil
+        continuousEventLock.unlock()
+
+        for pending in events {
+            yieldToSubscribers(pending.input)
+        }
+    }
+
+    private func clearPendingContinuousEvents() {
+        continuousEventLock.lock()
+        pendingContinuousEvents.removeAll()
+        continuousFlushID = nil
+        continuousEventLock.unlock()
+    }
+
+    private func yieldToSubscribers(_ inputEvent: MIDIInputEvent) {
         subscriberLock.lock()
         let continuations = Array(eventContinuations.values)
         subscriberLock.unlock()
@@ -353,8 +430,6 @@ final class MIDIEngine: ObservableObject, @unchecked Sendable {
         for continuation in continuations {
             continuation.yield(inputEvent)
         }
-
-        scheduleLastEventUpdate(inputEvent)
     }
 
     private func removeEventContinuation(id: UUID) {

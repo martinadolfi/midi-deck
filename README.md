@@ -150,6 +150,8 @@ MIDI channels are written as `1` through `16`; notes, controller numbers, CC val
 
 Only `setVolume` and `setInputVolume` are valid for `controlChange`. All other actions require `noteOn` or `noteOff`.
 
+Continuous controls use latest-value-wins delivery: dense CC bursts are coalesced per controller, and slow CoreAudio writes never queue intermediate slider positions. Pad and button events remain immediate and are not coalesced.
+
 ### Action types
 
 | Action | Fields | Behavior |

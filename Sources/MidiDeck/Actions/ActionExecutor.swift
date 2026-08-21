@@ -11,6 +11,13 @@ struct ActionActivity: Identifiable {
     let succeeded: Bool
 }
 
+struct ContinuousActionResult: Sendable {
+    let succeeded: Bool
+    let detail: String
+}
+
+typealias ContinuousActionHandler = @Sendable (Action, UInt8) -> ContinuousActionResult
+
 /// Matches routed MIDI input to configured actions and owns feedback state.
 /// Calls arrive on the main actor so configuration, activity UI, and throttled
 /// CC state stay coherent when profiles or files change.
@@ -26,11 +33,19 @@ final class ActionExecutor: ObservableObject {
         let mapping: Mapping
         let source: MIDIEndpointReference
         let value: UInt8
+        let sequence: UInt64
     }
 
     private var latestCC: [String: PendingCC] = [:]
     private var appliedCC: [String: UInt8] = [:]
-    private var ccTimer: DispatchSourceTimer?
+    private let continuousActionHandler: ContinuousActionHandler
+    private let ccExecutionQueue = DispatchQueue(
+        label: "com.midideck.audio.continuous",
+        qos: .userInteractive
+    )
+    private var ccSequence: UInt64 = 0
+    private var ccGeneration: UInt64 = 0
+    private var ccInFlight = false
     private var feedbackGeneration: UInt64 = 0
     private var pendingFeedbackTasks: [UUID: Task<Void, Never>] = [:]
     private var configurationCancellable: AnyCancellable?
@@ -40,11 +55,17 @@ final class ActionExecutor: ObservableObject {
     private var toastWindow: NSWindow?
     private var toastDismissTask: Task<Void, Never>?
 
-    init(configManager: ConfigManager, midiOutput: MIDIOutputManager) {
+    init(
+        configManager: ConfigManager,
+        midiOutput: MIDIOutputManager,
+        continuousActionHandler: ContinuousActionHandler? = nil
+    ) {
         self.configManager = configManager
         self.midiOutput = midiOutput
+        self.continuousActionHandler = continuousActionHandler ?? { @Sendable action, value in
+            Self.performContinuousAction(action: action, value: value)
+        }
         self.lastProfileName = configManager.config.activeProfile
-        startCCTimer()
         configurationCancellable = configManager.$config
             .dropFirst()
             .sink { [weak self] _ in
@@ -55,7 +76,6 @@ final class ActionExecutor: ObservableObject {
     }
 
     deinit {
-        ccTimer?.cancel()
         pendingFeedbackTasks.values.forEach { $0.cancel() }
         toastDismissTask?.cancel()
     }
@@ -92,7 +112,14 @@ final class ActionExecutor: ObservableObject {
             }
 
             let key = "\(profileName):\(mapping.id.uuidString):\(input.source.uniqueID)"
-            latestCC[key] = PendingCC(mapping: mapping, source: input.source, value: value)
+            ccSequence &+= 1
+            latestCC[key] = PendingCC(
+                mapping: mapping,
+                source: input.source,
+                value: value,
+                sequence: ccSequence
+            )
+            startNextContinuousActionIfNeeded()
         } else {
             log("[Action] Matched on \(input.source.name): \(mapping.description) → \(mapping.action.type.rawValue)")
             let result = execute(mapping: mapping)
@@ -111,6 +138,7 @@ final class ActionExecutor: ObservableObject {
     func clearPendingControls() {
         latestCC.removeAll()
         appliedCC.removeAll()
+        ccGeneration &+= 1
     }
 
     /// Reconciles controller state after any validated configuration change.
@@ -133,27 +161,50 @@ final class ActionExecutor: ObservableObject {
         sendInitialLEDStates()
     }
 
-    // MARK: - CC throttling
+    // MARK: - Continuous controls
 
-    private func startCCTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(30))
-        timer.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
-                self?.flushCC()
+    /// Runs at most one CoreAudio mutation at a time. While it is running, every
+    /// incoming value replaces the previous pending value for that control. This
+    /// bounds work to one in-flight write plus the newest requested state instead
+    /// of building a FIFO that continues moving after the physical fader stops.
+    private func startNextContinuousActionIfNeeded() {
+        guard !ccInFlight else { return }
+
+        while let (key, pending) = latestCC.max(by: { $0.value.sequence < $1.value.sequence }) {
+            latestCC.removeValue(forKey: key)
+            guard appliedCC[key] != pending.value else { continue }
+
+            ccInFlight = true
+            let generation = ccGeneration
+            let handler = continuousActionHandler
+            log("[Action] \(pending.mapping.description) → val:\(pending.value)")
+
+            ccExecutionQueue.async { [weak self] in
+                let result = handler(pending.mapping.action, pending.value)
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated {
+                        self?.finishContinuousAction(
+                            key: key,
+                            pending: pending,
+                            generation: generation,
+                            result: result
+                        )
+                    }
+                }
             }
+            return
         }
-        timer.resume()
-        ccTimer = timer
     }
 
-    private func flushCC() {
-        let pendingValues = latestCC
-        latestCC.removeAll(keepingCapacity: true)
+    private func finishContinuousAction(
+        key: String,
+        pending: PendingCC,
+        generation: UInt64,
+        result: ContinuousActionResult
+    ) {
+        ccInFlight = false
 
-        for (key, pending) in pendingValues where appliedCC[key] != pending.value {
-            log("[Action] \(pending.mapping.description) → val:\(pending.value)")
-            let result = executeCC(action: pending.mapping.action, value: pending.value)
+        if generation == ccGeneration {
             if result.succeeded {
                 appliedCC[key] = pending.value
             }
@@ -164,22 +215,33 @@ final class ActionExecutor: ObservableObject {
                 succeeded: result.succeeded
             )
         }
+
+        startNextContinuousActionIfNeeded()
     }
 
-    private func executeCC(action: Action, value: UInt8) -> (succeeded: Bool, detail: String) {
+    nonisolated static func performContinuousAction(
+        action: Action,
+        value: UInt8
+    ) -> ContinuousActionResult {
         switch action.type {
         case .setVolume:
             let device = action.device ?? "default"
             let success = AudioActions.setVolume(deviceName: device, ccValue: value)
-            return (success, success ? "Output volume \(Int(value) * 100 / 127)%" : "Could not set output volume")
+            return ContinuousActionResult(
+                succeeded: success,
+                detail: success ? "Output volume \(Int(value) * 100 / 127)%" : "Could not set output volume"
+            )
 
         case .setInputVolume:
             let device = action.device ?? "default"
             let success = AudioActions.setInputVolume(deviceName: device, ccValue: value)
-            return (success, success ? "Input volume \(Int(value) * 100 / 127)%" : "Could not set input volume")
+            return ContinuousActionResult(
+                succeeded: success,
+                detail: success ? "Input volume \(Int(value) * 100 / 127)%" : "Could not set input volume"
+            )
 
         default:
-            return (false, "Unsupported continuous action")
+            return ContinuousActionResult(succeeded: false, detail: "Unsupported continuous action")
         }
     }
 

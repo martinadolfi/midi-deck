@@ -172,8 +172,8 @@ final class AudioDeviceManager: @unchecked Sendable {
     func setVolume(_ volume: Float, deviceName: String) -> Bool {
         let deviceID: AudioDeviceID
         if deviceName == "default" {
-            guard let dev = defaultOutputDevice() else { return false }
-            deviceID = dev.id
+            deviceID = getDefaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice)
+            guard deviceID != kAudioObjectUnknown else { return false }
         } else {
             guard let dev = outputDevice(named: deviceName) else {
                 log("[Audio] Device not found for volume: \(deviceName)")
@@ -182,6 +182,25 @@ final class AudioDeviceManager: @unchecked Sendable {
             deviceID = dev.id
         }
         return setVolume(volume, deviceID: deviceID)
+    }
+
+    func setInputVolume(_ volume: Float, deviceName: String) -> Bool {
+        let deviceID: AudioDeviceID
+        if deviceName == "default" {
+            deviceID = getDefaultDevice(selector: kAudioHardwarePropertyDefaultInputDevice)
+            guard deviceID != kAudioObjectUnknown else { return false }
+        } else {
+            guard let device = inputDevice(named: deviceName) else {
+                log("[Audio] Input device not found for volume: \(deviceName)")
+                return false
+            }
+            deviceID = device.id
+        }
+        return setVolume(
+            volume,
+            deviceID: deviceID,
+            scope: kAudioDevicePropertyScopeInput
+        )
     }
 
     // MARK: - Mute

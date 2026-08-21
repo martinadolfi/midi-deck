@@ -25,11 +25,7 @@ enum AudioActions {
     @discardableResult
     static func setInputVolume(deviceName: String, ccValue: UInt8) -> Bool {
         let volume = Float(ccValue) / 127.0
-        guard let device = audio.inputDevice(named: deviceName) else {
-            log("[Audio] Input device not found for volume: \(deviceName)")
-            return false
-        }
-        return audio.setVolume(volume, deviceID: device.id, scope: kAudioDevicePropertyScopeInput)
+        return audio.setInputVolume(volume, deviceName: deviceName)
     }
 
     /// Toggle mic mute. Returns the new mute state, or nil on failure.
