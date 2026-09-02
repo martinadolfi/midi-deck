@@ -1,75 +1,135 @@
-import SwiftUI
-import CoreMIDI
-import os.log
 import ApplicationServices
+import Combine
+import CoreMIDI
+import SwiftUI
+import os.log
 
 private let logger = Logger(subsystem: "com.midideck", category: "app")
 
-/// Logs to stderr so output always appears in the terminal.
+/// Logs to stderr as well as Unified Logging so development builds remain easy
+/// to diagnose from a terminal.
 func log(_ message: String) {
     fputs(message + "\n", stderr)
     logger.info("\(message)")
 }
 
-/// Shared state that starts the MIDI engine immediately on creation.
+@MainActor
 final class AppState: ObservableObject {
-    let configManager = ConfigManager()
-    let midiEngine = MIDIEngine()
-    let midiOutput = MIDIOutputManager()
-    var actionExecutor: ActionExecutor?
+    let configManager: ConfigManager
+    let midiEngine: MIDIEngine
+    let midiOutput: MIDIOutputManager
+    let actionExecutor: ActionExecutor
+
+    @Published var actionsPaused = false
+    @Published private(set) var isLearning = false
+    @Published private(set) var routingNotice: String?
+
     private var eventLoopTask: Task<Void, Never>?
+    private var feedbackRefreshCancellable: AnyCancellable?
+    private var configurationRefreshCancellable: AnyCancellable?
 
     init() {
-        log("[MidiDeck] Initializing...")
+        let manager = ConfigManager()
+        let engine = MIDIEngine()
+        let output = MIDIOutputManager()
 
-        configManager.load()
-        midiEngine.start()
-        midiOutput.start()
+        configManager = manager
+        midiEngine = engine
+        midiOutput = output
+        actionExecutor = ActionExecutor(configManager: manager, midiOutput: output)
 
-        let executor = ActionExecutor(configManager: configManager, midiOutput: midiOutput)
-        actionExecutor = executor
+        log("[MidiDeck] Initializing…")
+        _ = manager.load()
+        engine.start()
+        output.start()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            executor.sendInitialLEDStates()
-        }
-
-        eventLoopTask = Task { [weak self] in
-            guard let self else { return }
-            for await event in self.midiEngine.eventStream {
-                if Task.isCancelled { break }
-                executor.handle(event: event)
+        eventLoopTask = Task { [weak self, engine] in
+            for await input in engine.events() {
+                guard !Task.isCancelled, let self else { break }
+                route(input)
             }
         }
 
-        log("[MidiDeck] Started")
-        checkAccessibilityPermission()
-    }
-
-    private func checkAccessibilityPermission() {
-        let trusted = AXIsProcessTrusted()
-        if !trusted {
-            log("[MidiDeck] WARNING: Accessibility permission not granted — window cycling will not work")
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "MidiDeck needs Accessibility access to cycle windows. Please grant permission in System Settings → Privacy & Security → Accessibility, then relaunch MidiDeck."
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Later")
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        // Rehydrate feedback after a destination is connected or reconnected.
+        feedbackRefreshCancellable = engine.$connectedDestinations
+            .dropFirst()
+            .debounce(for: .milliseconds(350), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.actionExecutor.sendInitialLEDStates()
                 }
             }
-        } else {
-            log("[MidiDeck] Accessibility permission granted")
+
+        // Configuration can change through the visual editor or an external
+        // JSON edit. Reset continuous-control caches and rehydrate feedback for
+        // both paths so a previously applied CC value never masks a new action.
+        configurationRefreshCancellable = manager.$config
+            .dropFirst()
+            .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.actionExecutor.configurationDidChange()
+                }
+            }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.actionExecutor.sendInitialLEDStates()
         }
+
+        if !AXIsProcessTrusted() {
+            log("[MidiDeck] Accessibility is off; app launching works, but window cycling is limited")
+        }
+        log("[MidiDeck] Started")
     }
 
     deinit {
         eventLoopTask?.cancel()
         midiEngine.stop()
         midiOutput.stop()
+    }
+
+    func beginLearning() {
+        isLearning = true
+        routingNotice = "MIDI Learn is listening; actions are temporarily paused."
+        actionExecutor.clearPendingControls()
+    }
+
+    func endLearning() {
+        isLearning = false
+        routingNotice = nil
+    }
+
+    func setPaused(_ paused: Bool) {
+        actionsPaused = paused
+        if paused {
+            actionExecutor.clearPendingControls()
+            routingNotice = "Actions are paused."
+        } else {
+            routingNotice = nil
+        }
+    }
+
+    @discardableResult
+    func reloadConfiguration() -> Bool {
+        configManager.load()
+    }
+
+    private func route(_ input: MIDIInputEvent) {
+        guard !actionsPaused, !isLearning else { return }
+
+        guard configManager.config.inputRoute(
+            for: input,
+            among: midiEngine.connectedSources
+        ) != nil else {
+            if configManager.config.midi.inputMode == .automatic,
+               midiEngine.connectedSources.count > 1 {
+                routingNotice = "Choose which MIDI controller MidiDeck should respond to."
+            }
+            return
+        }
+
+        routingNotice = nil
+        actionExecutor.handle(input: input, connectedSources: midiEngine.connectedSources)
     }
 }
 
@@ -79,36 +139,67 @@ struct MidiDeckApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(
-                configManager: appState.configManager,
-                midiEngine: appState.midiEngine,
-                onSendLEDs: { appState.actionExecutor?.sendInitialLEDStates() },
-                onOpenSettings: { openSettings() }
-            )
+            MenuBarView(appState: appState)
         } label: {
-            Image(systemName: "square.grid.3x3.fill")
+            MenuBarIcon(appState: appState)
         }
         .menuBarExtraStyle(.window)
 
-        Window("MidiDeck Settings", id: "settings") {
-            SettingsView(configManager: appState.configManager, midiEngine: appState.midiEngine)
+        Window("MidiDeck Control Center", id: "settings") {
+            SettingsView(appState: appState)
         }
-        .defaultSize(width: 700, height: 500)
+        .defaultSize(width: 900, height: 620)
+        .windowResizability(.contentMinSize)
     }
 
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)
     }
+}
 
-    private func openSettings() {
-        NSApplication.shared.setActivationPolicy(.regular)
-        for window in NSApplication.shared.windows {
-            if window.title.contains("Settings") {
-                window.makeKeyAndOrderFront(nil)
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                return
+private struct MenuBarIcon: View {
+    @ObservedObject var appState: AppState
+    @ObservedObject private var configManager: ConfigManager
+    @ObservedObject private var midiEngine: MIDIEngine
+
+    init(appState: AppState) {
+        self.appState = appState
+        _configManager = ObservedObject(wrappedValue: appState.configManager)
+        _midiEngine = ObservedObject(wrappedValue: appState.midiEngine)
+    }
+
+    var body: some View {
+        Image(systemName: symbol)
+            .accessibilityLabel("MidiDeck")
+            .accessibilityValue(status)
+    }
+
+    private var symbol: String {
+        if configManager.configError != nil || midiEngine.initializationError != nil {
+            return "exclamationmark.square.fill"
+        }
+        if appState.actionsPaused || appState.isLearning {
+            return "square.grid.3x3.middle.filled"
+        }
+        return "square.grid.3x3.fill"
+    }
+
+    private var status: String {
+        if configManager.configError != nil { return "Configuration error" }
+        if midiEngine.initializationError != nil { return "MIDI error" }
+        if appState.isLearning { return "MIDI Learn active" }
+        if appState.actionsPaused { return "Actions paused" }
+        if midiEngine.connectedSources.isEmpty { return "No controller connected" }
+        if configManager.config.midi.inputMode == .automatic,
+           midiEngine.connectedSources.count > 1 {
+            return "Controller selection required"
+        }
+        if configManager.config.midi.inputMode == .selected {
+            let connectedIDs = Set(midiEngine.connectedSources.map(\.uniqueID))
+            if configManager.config.midi.inputSources.allSatisfy({ !connectedIDs.contains($0.uniqueID) }) {
+                return "Waiting for selected controller"
             }
         }
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        return "Ready"
     }
 }

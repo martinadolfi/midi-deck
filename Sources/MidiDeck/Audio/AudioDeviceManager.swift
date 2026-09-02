@@ -2,7 +2,7 @@ import CoreAudio
 import AudioToolbox
 import Foundation
 
-struct AudioDevice {
+struct AudioDevice: Identifiable, Hashable {
     let id: AudioDeviceID
     let name: String
     let uid: String
@@ -10,7 +10,7 @@ struct AudioDevice {
     let hasOutput: Bool
 }
 
-final class AudioDeviceManager {
+final class AudioDeviceManager: @unchecked Sendable {
     static let shared = AudioDeviceManager()
 
     private init() {}
@@ -60,7 +60,21 @@ final class AudioDeviceManager {
         if name == "default" {
             return nil  // Caller should handle "default" specially
         }
-        return allDevices().first { $0.name.localizedCaseInsensitiveContains(name) }
+        return uniqueMatch(named: name, in: allDevices(), kind: "audio")
+    }
+
+    func outputDevice(named name: String) -> AudioDevice? {
+        if name == "default" {
+            return defaultOutputDevice()
+        }
+        return uniqueMatch(named: name, in: outputDevices(), kind: "output")
+    }
+
+    func inputDevice(named name: String) -> AudioDevice? {
+        if name == "default" {
+            return defaultInputDevice()
+        }
+        return uniqueMatch(named: name, in: inputDevices(), kind: "input")
     }
 
     // MARK: - Default Device
@@ -86,7 +100,7 @@ final class AudioDeviceManager {
     }
 
     func setDefaultOutputDevice(named name: String) -> Bool {
-        guard let device = outputDevices().first(where: { $0.name.localizedCaseInsensitiveContains(name) }) else {
+        guard let device = outputDevice(named: name) else {
             log("[Audio] Output device not found: \(name)")
             return false
         }
@@ -102,7 +116,7 @@ final class AudioDeviceManager {
     }
 
     func setDefaultInputDevice(named name: String) -> Bool {
-        guard let device = inputDevices().first(where: { $0.name.localizedCaseInsensitiveContains(name) }) else {
+        guard let device = inputDevice(named: name) else {
             log("[Audio] Input device not found: \(name)")
             return false
         }
@@ -158,16 +172,35 @@ final class AudioDeviceManager {
     func setVolume(_ volume: Float, deviceName: String) -> Bool {
         let deviceID: AudioDeviceID
         if deviceName == "default" {
-            guard let dev = defaultOutputDevice() else { return false }
-            deviceID = dev.id
+            deviceID = getDefaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice)
+            guard deviceID != kAudioObjectUnknown else { return false }
         } else {
-            guard let dev = findDevice(named: deviceName) else {
+            guard let dev = outputDevice(named: deviceName) else {
                 log("[Audio] Device not found for volume: \(deviceName)")
                 return false
             }
             deviceID = dev.id
         }
         return setVolume(volume, deviceID: deviceID)
+    }
+
+    func setInputVolume(_ volume: Float, deviceName: String) -> Bool {
+        let deviceID: AudioDeviceID
+        if deviceName == "default" {
+            deviceID = getDefaultDevice(selector: kAudioHardwarePropertyDefaultInputDevice)
+            guard deviceID != kAudioObjectUnknown else { return false }
+        } else {
+            guard let device = inputDevice(named: deviceName) else {
+                log("[Audio] Input device not found for volume: \(deviceName)")
+                return false
+            }
+            deviceID = device.id
+        }
+        return setVolume(
+            volume,
+            deviceID: deviceID,
+            scope: kAudioDevicePropertyScopeInput
+        )
     }
 
     // MARK: - Mute
@@ -204,7 +237,7 @@ final class AudioDeviceManager {
             guard let dev = defaultInputDevice() else { return nil }
             deviceID = dev.id
         } else {
-            guard let dev = inputDevices().first(where: { $0.name.localizedCaseInsensitiveContains(deviceName) }) else {
+            guard let dev = inputDevice(named: deviceName) else {
                 log("[Audio] Input device not found for mute: \(deviceName)")
                 return nil
             }
@@ -226,13 +259,21 @@ final class AudioDeviceManager {
             guard let dev = defaultInputDevice() else { return false }
             deviceID = dev.id
         } else {
-            guard let dev = inputDevices().first(where: { $0.name.localizedCaseInsensitiveContains(deviceName) }) else {
+            guard let dev = inputDevice(named: deviceName) else {
                 log("[Audio] Input device not found for mute: \(deviceName)")
                 return false
             }
             deviceID = dev.id
         }
         return setMute(muted, deviceID: deviceID)
+    }
+
+    func muteState(deviceName: String) -> Bool? {
+        guard let device = inputDevice(named: deviceName) else {
+            log("[Audio] Input device not found for mute state: \(deviceName)")
+            return nil
+        }
+        return isMuted(deviceID: device.id)
     }
 
     // MARK: - Private Helpers
@@ -311,5 +352,30 @@ final class AudioDeviceManager {
             &propertyAddress, 0, nil, dataSize, &devID
         )
         return status == noErr
+    }
+
+    /// Prefer an exact name. A partial legacy name is accepted only when it is
+    /// unambiguous, so adding a similarly named device cannot silently reroute
+    /// an action.
+    private func uniqueMatch(named name: String, in devices: [AudioDevice], kind: String) -> AudioDevice? {
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let exact = devices.filter { $0.name.compare(name, options: options) == .orderedSame }
+        if exact.count == 1 {
+            return exact[0]
+        }
+        if exact.count > 1 {
+            log("[Audio] Ambiguous exact \(kind) device name: \(name)")
+            return nil
+        }
+
+        let partial = devices.filter { $0.name.range(of: name, options: options) != nil }
+        if partial.count == 1 {
+            return partial[0]
+        }
+        if partial.count > 1 {
+            let matches = partial.map(\.name).joined(separator: ", ")
+            log("[Audio] Ambiguous \(kind) device '\(name)' matches: \(matches)")
+        }
+        return nil
     }
 }

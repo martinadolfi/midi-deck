@@ -1,5 +1,6 @@
 # Swift / SPM build artifacts
 .build/
+.build-*/
 .swiftpm/
 *.xcarchive
 

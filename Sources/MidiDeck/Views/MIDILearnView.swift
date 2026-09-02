@@ -1,194 +1,204 @@
+import AppKit
 import SwiftUI
 
 struct MIDILearnView: View {
-    @ObservedObject var configManager: ConfigManager
-    @ObservedObject var midiEngine: MIDIEngine
+    @ObservedObject var appState: AppState
+    @ObservedObject private var midiEngine: MIDIEngine
     let profileName: String
-    @Environment(\.dismiss) private var dismiss
 
-    @State private var capturedEvent: MIDIEvent?
+    @Environment(\.dismiss) private var dismiss
+    @State private var capturedInput: MIDIInputEvent?
+    @State private var draftMapping: Mapping?
     @State private var listenTask: Task<Void, Never>?
-    @State private var isListening = true
-    @State private var selectedActionType: Action.ActionType = .openApp
-    @State private var actionBundleId: String = ""
-    @State private var actionDevice: String = "default"
-    @State private var actionProfile: String = ""
-    @State private var description: String = ""
-    @State private var ledEnabled: Bool = true
-    @State private var ledColor: LEDConfig.LEDColor = .red
+
+    init(appState: AppState, profileName: String) {
+        self.appState = appState
+        _midiEngine = ObservedObject(wrappedValue: appState.midiEngine)
+        self.profileName = profileName
+    }
 
     var body: some View {
-        VStack(spacing: 16) {
-            Text("MIDI Learn")
-                .font(.title2)
+        Group {
+            if let capturedInput, let draftMapping {
+                MappingEditor(
+                    mapping: draftMapping,
+                    appState: appState,
+                    profileName: profileName,
+                    isNew: true,
+                    learnedInput: capturedInput,
+                    onRelearn: resetAndListen
+                )
+            } else {
+                listeningView
+            }
+        }
+        .onAppear {
+            appState.beginLearning()
+            startListening()
+        }
+        .onDisappear {
+            listenTask?.cancel()
+            appState.endLearning()
+        }
+    }
 
-            // Step 1: Capture
-            GroupBox("Step 1: Press a pad or move a fader") {
-                if isListening {
-                    HStack {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Listening for MIDI input...")
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                } else if let event = capturedEvent {
-                    VStack(spacing: 4) {
-                        Text("Captured:")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text(event.description)
-                            .font(.system(.body, design: .monospaced))
-                        Button("Re-listen") {
-                            capturedEvent = nil
-                            isListening = true
-                            startListening()
-                        }
-                        .controlSize(.small)
-                    }
-                    .padding()
+    private var listeningView: some View {
+        VStack(spacing: 22) {
+            Spacer()
+
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.1))
+                    .frame(width: 108, height: 108)
+                if midiEngine.initializationError != nil {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 38))
+                        .foregroundStyle(.red)
+                } else if midiEngine.connectedSources.isEmpty {
+                    Image(systemName: "cable.connector.slash")
+                        .font(.system(size: 38))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Image(systemName: "dot.radiowaves.left.and.right")
+                        .font(.system(size: 42))
+                        .foregroundStyle(.tint)
+                        .symbolEffect(.variableColor.iterative, options: .repeating)
                 }
             }
+            .accessibilityHidden(true)
 
-            // Step 2: Assign action
-            if capturedEvent != nil {
-                GroupBox("Step 2: Assign an action") {
-                    Form {
-                        TextField("Description", text: $description)
-
-                        Picker("Action", selection: $selectedActionType) {
-                            ForEach(Action.ActionType.allCases, id: \.self) { type in
-                                Text(type.rawValue).tag(type)
-                            }
-                        }
-
-                        switch selectedActionType {
-                        case .openApp:
-                            TextField("Bundle ID", text: $actionBundleId)
-                        case .setAudioOutput, .setAudioInput, .setVolume, .setInputVolume, .switchAudioDevice, .toggleMicMute, .setMicMute:
-                            TextField("Device name", text: $actionDevice)
-                        case .switchProfile:
-                            Picker("Profile", selection: $actionProfile) {
-                                ForEach(configManager.profileNames, id: \.self) { name in
-                                    Text(name).tag(name)
-                                }
-                            }
-                        }
-
-                        Toggle("Enable LED", isOn: $ledEnabled)
-                        if ledEnabled {
-                            Picker("LED Color", selection: $ledColor) {
-                                ForEach(LEDConfig.LEDColor.allCases, id: \.self) { color in
-                                    Text(color.rawValue).tag(color)
-                                }
-                            }
-                        }
-                    }
-                    .formStyle(.grouped)
-                }
+            VStack(spacing: 8) {
+                Text(listeningTitle)
+                    .font(.title2.weight(.semibold))
+                Text(listeningDescription)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 390)
             }
 
-            // Buttons
+            if let initializationError = midiEngine.initializationError {
+                VStack(spacing: 10) {
+                    Text(initializationError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+
+                    HStack(spacing: 8) {
+                        Button("Try Again", systemImage: "arrow.clockwise") {
+                            retryMIDI()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("Open Audio MIDI Setup") {
+                            openAudioMIDISetup()
+                        }
+                    }
+                }
+                .frame(maxWidth: 420)
+            } else if !midiEngine.connectedSources.isEmpty {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Listening to \(midiEngine.connectedSources.count == 1 ? midiEngine.connectedSources[0].name : "all \(midiEngine.connectedSources.count) connected controllers")…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(.quaternary, in: Capsule())
+            }
+
+            Spacer()
+
             HStack {
                 Button("Cancel") {
                     listenTask?.cancel()
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
-
                 Spacer()
-
-                if capturedEvent != nil {
-                    Button("Add Mapping") {
-                        addMapping()
-                        dismiss()
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!isActionValid)
-                }
+                Text("Profile: \(profileName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding()
-        .frame(minWidth: 450, minHeight: 350)
-        .onAppear {
-            startListening()
-        }
-        .onDisappear {
-            listenTask?.cancel()
-        }
+        .padding(26)
+        .frame(minWidth: 520, minHeight: 440)
     }
 
-    private var isActionValid: Bool {
-        switch selectedActionType {
-        case .openApp: return !actionBundleId.isEmpty
-        case .switchProfile: return !actionProfile.isEmpty
-        default: return true
+    private var listeningTitle: String {
+        if midiEngine.initializationError != nil { return "MIDI could not start" }
+        if midiEngine.connectedSources.isEmpty { return "Connect a MIDI controller" }
+        return "Move the control you want to map"
+    }
+
+    private var listeningDescription: String {
+        if midiEngine.initializationError != nil {
+            return "Retry the MIDI connection. If it still fails, inspect your devices in Audio MIDI Setup."
         }
+        if midiEngine.connectedSources.isEmpty {
+            return "MidiDeck will start listening automatically when a controller appears."
+        }
+        return "Press a pad or key, or move a knob or fader. Normal actions are paused while learning."
     }
 
     private func startListening() {
         listenTask?.cancel()
-        listenTask = Task {
-            for await event in midiEngine.eventStream {
-                if Task.isCancelled { break }
-                // Only capture noteOn and CC events
-                switch event {
+        listenTask = Task { [midiEngine] in
+            for await input in midiEngine.events(bufferLimit: 32) {
+                guard !Task.isCancelled else { return }
+                switch input.event {
                 case .noteOn, .controlChange:
-                    await MainActor.run {
-                        capturedEvent = event
-                        isListening = false
-                        prefillFromEvent(event)
-                    }
+                    capturedInput = input
+                    draftMapping = makeDraft(from: input)
                     return
-                default:
+                case .noteOff:
                     continue
                 }
             }
         }
     }
 
-    private func prefillFromEvent(_ event: MIDIEvent) {
-        switch event {
-        case .controlChange:
-            selectedActionType = .setVolume
-        default:
-            break
-        }
+    private func resetAndListen() {
+        capturedInput = nil
+        draftMapping = nil
+        startListening()
     }
 
-    private func addMapping() {
-        guard let event = capturedEvent else { return }
+    private func retryMIDI() {
+        midiEngine.start()
+        startListening()
+    }
 
+    private func openAudioMIDISetup() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Audio MIDI Setup.app"))
+    }
+
+    private func makeDraft(from input: MIDIInputEvent) -> Mapping {
         let trigger: Trigger
-        switch event {
-        case .noteOn(let ch, let note, _):
-            trigger = Trigger(type: .noteOn, channel: ch, note: note)
-        case .controlChange(let ch, let cc, _):
-            trigger = Trigger(type: .controlChange, channel: ch, controller: cc)
-        default:
-            return
+        let action: Action
+        let led: LEDConfig?
+
+        switch input.event {
+        case .noteOn(let channel, let note, _):
+            trigger = Trigger(type: .noteOn, channel: channel, note: note)
+            action = Action(type: .openApp)
+            led = LEDConfig(color: .blue, behavior: .solid)
+        case .controlChange(let channel, let controller, _):
+            trigger = Trigger(type: .controlChange, channel: channel, controller: controller)
+            action = Action(type: .setVolume, device: "default")
+            led = nil
+        case .noteOff(let channel, let note, _):
+            trigger = Trigger(type: .noteOff, channel: channel, note: note)
+            action = Action(type: .openApp)
+            led = LEDConfig(color: .blue, behavior: .solid)
         }
 
-        var action = Action(type: selectedActionType)
-        switch selectedActionType {
-        case .openApp:
-            action.bundleId = actionBundleId
-        case .setAudioOutput, .setAudioInput, .setVolume, .setInputVolume, .switchAudioDevice, .toggleMicMute, .setMicMute:
-            action.device = actionDevice
-        case .switchProfile:
-            action.profile = actionProfile
-        }
-
-        let led: LEDConfig? = ledEnabled ? LEDConfig(color: ledColor, behavior: .solid) : nil
-
-        let mapping = Mapping(
-            description: description,
+        return Mapping(
+            description: "",
+            source: input.source,
             trigger: trigger,
             action: action,
             led: led
         )
-
-        configManager.addMapping(mapping, toProfile: profileName)
     }
 }

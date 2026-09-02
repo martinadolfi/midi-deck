@@ -1,6 +1,12 @@
 import CoreMIDI
 import Foundation
 
+/// A parsed MIDI event together with the stable identity of the source that sent it.
+struct MIDIInputEvent: Sendable {
+    let source: MIDIEndpointReference
+    let event: MIDIEvent
+}
+
 /// Represents a parsed MIDI event.
 enum MIDIEvent: Sendable {
     case noteOn(channel: UInt8, note: UInt8, velocity: UInt8)
@@ -67,9 +73,13 @@ enum MIDIEvent: Sendable {
                 // Utility / System messages (1 word)
                 i += 1
 
-            case 0x3, 0x5:
-                // Data messages (2 words)
+            case 0x3:
+                // 64-bit data messages (2 words)
                 i += 2
+
+            case 0x5, 0xD, 0xF:
+                // 128-bit data, Flex Data, and UMP Stream messages (4 words)
+                i += 4
 
             default:
                 i += 1

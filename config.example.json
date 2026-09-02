@@ -1,13 +1,17 @@
 {
-  "version": 1,
+  "version": 2,
   "activeProfile": "default",
+  "midi": {
+    "inputMode": "automatic",
+    "inputSources": [],
+    "feedbackDestination": null
+  },
   "profiles": {
     "default": {
       "mappings": [
         {
           "id": "A0000001-0000-0000-0000-000000000001",
           "description": "Pad 1: Open Safari",
-          "device": "iRig",
           "trigger": { "type": "noteOn", "channel": 10, "note": 36 },
           "action": { "type": "openApp", "bundleId": "com.apple.Safari" },
           "led": { "color": "blue", "behavior": "solid" }
@@ -76,10 +80,45 @@
           "description": "Pad 1: Open OBS",
           "trigger": { "type": "noteOn", "channel": 10, "note": 36 },
           "action": { "type": "openApp", "bundleId": "com.obsproject.obs-studio" },
-          "led": { "color": "green", "behavior": "solid" }
+          "led": { "color": "green", "behavior": "blink" },
+          "feedback": [
+            { "channel": 10, "controller": 20, "value": 127 }
+          ]
         },
         {
           "id": "B0000001-0000-0000-0000-000000000002",
+          "description": "Pad 2: Select streaming microphone",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 37 },
+          "action": { "type": "setAudioInput", "device": "External Microphone" },
+          "led": { "color": "cyan", "behavior": "solid" }
+        },
+        {
+          "id": "B0000001-0000-0000-0000-000000000003",
+          "description": "Pad 3: Switch streaming audio pair",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 38 },
+          "action": {
+            "type": "switchAudioDevice",
+            "device": "External Headphones",
+            "inputDevice": "External Microphone",
+            "notify": "Streaming audio selected"
+          },
+          "led": { "color": "magenta", "behavior": "solid" }
+        },
+        {
+          "id": "B0000001-0000-0000-0000-000000000004",
+          "description": "Pad 4: Mute microphone",
+          "trigger": { "type": "noteOn", "channel": 10, "note": 39 },
+          "action": { "type": "setMicMute", "device": "default", "muted": true },
+          "led": { "color": "red", "behavior": "toggleOnMute" }
+        },
+        {
+          "id": "B0000001-0000-0000-0000-000000000005",
+          "description": "Fader 2: Microphone volume",
+          "trigger": { "type": "controlChange", "channel": 10, "controller": 2 },
+          "action": { "type": "setInputVolume", "device": "default" }
+        },
+        {
+          "id": "B0000001-0000-0000-0000-000000000006",
           "description": "Pad 8: Back to default profile",
           "trigger": { "type": "noteOn", "channel": 10, "note": 43 },
           "action": { "type": "switchProfile", "profile": "default" },
